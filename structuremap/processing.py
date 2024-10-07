@@ -216,6 +216,7 @@ def download_alphafold_pae(
 def format_alphafold_data(
     directory: str,
     protein_ids: list,
+    side_chain_dict = None
 ) -> pd.DataFrame:
     """
     Function to import structure files and format them into a combined dataframe.
@@ -228,6 +229,13 @@ def format_alphafold_data(
         List of UniProt protein accessions to create an annotation table.
         If an empty list is provided, all proteins in the provided directory
         are used to create the annotation table.
+    side_chain_dict : dict
+        Dictionary to specify the side chain atom for each amino acid.
+        Default is None, which uses the following dictionary:
+        {'R': 'NH2', 'H': 'NE2', 'K': 'NZ', 'D': 'OD2', 'E': 'OE2',
+        'S': 'OG', 'T': 'OG1', 'N': 'ND2', 'Q': 'NE2', 'C': 'SG', 'G': 'CA',
+        'P': 'CG', 'A': 'CB', 'V': 'CG1', 'I': 'CD1', 'L': 'CD1', 'M': 'CE',
+        'F': 'CZ', 'Y': 'OH', 'W': 'CH2'}
 
     Returns
     -------
@@ -239,6 +247,31 @@ def format_alphafold_data(
         'z_coord_cb', 'z_coord_n', 'secondary_structure', 'structure_group',
         'BEND', 'HELX', 'STRN', 'TURN', 'unstructured']
     """
+
+    # Set default side chain dictionary
+    if side_chain_dict is None:
+        side_chain_dict = {
+            'R': 'NH2',
+            'H': 'NE2',
+            'K': 'NZ',
+            'D': 'OD2',
+            'E': 'OE2',
+            'S': 'OG',
+            'T': 'OG1',
+            'N': 'ND2',
+            'Q': 'NE2',
+            'C': 'SG',
+            'G': 'CA',
+            'P': 'CG',
+            'A': 'CB',
+            'V': 'CG1',
+            'I': 'CD1',
+            'L': 'CD1',
+            'M': 'CE',
+            'F': 'CZ',
+            'Y': 'OH',
+            'W': 'CH2'
+        }
 
     alphafold_annotation_l = []
     protein_number = 0
@@ -266,7 +299,7 @@ def format_alphafold_data(
                                    'y_coord': structure['_atom_site.Cartn_y'],
                                    'z_coord': structure['_atom_site.Cartn_z']})
 
-                df = df[df.atom_id.isin(['CA', 'CB', 'C', 'N'])].reset_index(drop=True)
+                df = df.reset_index(drop=True)
                 df = df.pivot(index=['protein_id',
                                      'protein_number',
                                      'AA', 'position',
@@ -274,6 +307,12 @@ def format_alphafold_data(
                               columns="atom_id")
                 df = pd.DataFrame(df.to_records())
 
+                # Get side chain atom positions
+                df["x_coord_sc"] = df.apply(lambda x: x["('x_coord', '" + side_chain_dict[x['AA']] + "')"], axis=1)
+                df["y_coord_sc"] = df.apply(lambda x: x["('y_coord', '" + side_chain_dict[x['AA']] + "')"], axis=1)
+                df["z_coord_sc"] = df.apply(lambda x: x["('z_coord', '" + side_chain_dict[x['AA']] + "')"], axis=1)
+
+                # Rename columns
                 df = df.rename(columns={"('x_coord', 'CA')": "x_coord_ca",
                                         "('y_coord', 'CA')": "y_coord_ca",
                                         "('z_coord', 'CA')": "z_coord_ca",
@@ -286,6 +325,9 @@ def format_alphafold_data(
                                         "('x_coord', 'N')": "x_coord_n",
                                         "('y_coord', 'N')": "y_coord_n",
                                         "('z_coord', 'N')": "z_coord_n"})
+                
+                # Drop unnecessary positional columns
+                df.drop(df.columns[df.columns.str.contains("', ")], axis=1, inplace=True)
 
                 df = df.apply(pd.to_numeric, errors='ignore')
 
@@ -448,6 +490,7 @@ def get_gly_vector(
 def get_angle(
     coord_a: np.ndarray,
     coord_b: np.ndarray,
+    coord_target: np.ndarray,
     coord_c: np.ndarray,
     coord_n: np.ndarray,
     idx_1: int,
@@ -467,6 +510,9 @@ def get_angle(
     coord_b : np.ndarray
         Array of 3D coordinates of beta carbon atoms across different
         amino acids.
+    coord_target : np.ndarray
+        Array of 3D coordinates of the target amino acid's atom of choice,
+        typical choices would be alpha carbon or side chain atom.
     coord_c : np.ndarray
         Array of 3D coordinates of carboxy carbon atoms across different
         amino acids.
@@ -494,7 +540,7 @@ def get_angle(
         # Calculate unit vector for Ca1 -> Cb1
         uv_1 = (coord_b[idx_1] - coord_a[idx_1]) / get_3d_dist(coord_b, coord_a, idx_1, idx_1)
     # Calculate unit vector for Ca1 -> Ca2
-    uv_d = (coord_a[idx_2] - coord_a[idx_1]) / get_3d_dist(coord_a, coord_a, idx_1, idx_2)
+    uv_d = (coord_target[idx_2] - coord_a[idx_1]) / get_3d_dist(coord_target, coord_a, idx_1, idx_2)
     # Calculate the angle between the two unit vectors
     dot_p = np.dot(uv_1, uv_d)
     # angle = np.arccos(np.clip(dot_p, -1.0, 1.0))
@@ -548,7 +594,9 @@ def get_neighbors(
     position: np.ndarray,
     error_dist: np.ndarray,
     max_dist: float,
-    max_angle: float
+    max_angle: float,
+    coord_target = None,
+    coord_source = None
 ) -> np.ndarray:
     """
     Get the number of amino acids within the specified distance and angle
@@ -580,13 +628,23 @@ def get_neighbors(
     max_angle : float
         Float specifying the maximum angle (in degrees) between two
         amino acids.
+    coord_target : np.ndarray
+        Array of 3D coordinates of the target amino acid's sidechain atom,
+        if not provided the CA atom is used.
+    coord_source : np.ndarray
+        Array of 3D coordinates of the source amino acid's sidechain atom,
+        if not provided the CA atom is used.
 
     Returns
     -------
     : np.ndarray
         Number of amino acids within the specified distance and angle.
     """
-    res = []
+    if coord_target is None:
+        coord_target = coord_a
+    if coord_source is None:
+        coord_source = coord_a
+    res_adjacency = np.zeros((len(idx_list), len(idx_list)), dtype=np.int32)
     for x1 in idx_list:
         n_neighbors = 0
         for x2 in idx_list:
@@ -598,22 +656,22 @@ def get_neighbors(
                     idx_2=x2)
                 if (paired_error <= max_dist):
                     dist = get_3d_dist(
-                        coordinate_array_1=coord_a,
-                        coordinate_array_2=coord_a,
+                        coordinate_array_1=coord_source,
+                        coordinate_array_2=coord_target,
                         idx_1=x1,
                         idx_2=x2)
                     if (dist + paired_error <= max_dist):
                         angle = get_angle(
                             coord_a=coord_a,
                             coord_b=coord_b,
+                            coord_target=coord_target,
                             coord_c=coord_c,
                             coord_n=coord_n,
                             idx_1=x1,
                             idx_2=x2)
                         if angle <= max_angle:
-                            n_neighbors += 1
-        res.append(n_neighbors)
-    return(np.array(res))
+                            res_adjacency[x1, x2] = 1
+    return res_adjacency
 
 
 @numba.njit
@@ -681,12 +739,14 @@ def partition_df_by_prots(
         yield prot_df.reset_index(drop=True)
 
 
-def annotate_accessibility(
+def calculate_pPSE(
     df: pd.DataFrame,
     max_dist: float,
     max_angle: float,
     error_dir: str,
     filename_format: str = "pae_{}.hdf",
+    sidechain: str = None,
+    individual_residue_counts: bool = False
 ) -> pd.DataFrame:
     """
     Half sphere exposure as calculated in
@@ -711,6 +771,15 @@ def annotate_accessibility(
         The file name of the pae files saved by download_alphafold_pae.
         The brackets {} are replaced by a protein name from the proteins list.
         Default is 'pae_{}.hdf'.
+    sidechain: str
+        Whether to use sidechain atoms in the distance calculation, instead of 
+        CA. Options are None (default), which uses the CA to CA distance, 
+        'target_only', which uses CA to nearby sidechain atom distance, or
+        'source_and_target', which uses the sidechain atom to sidechain atom
+         distance. In all cases angles are still calculated along the CA-CB axis.
+    individual_residue_counts: bool
+        Whether to return the counts of neighboring amino acids for each type,
+        along with the total count (nAA). Default is False.
 
     Returns
     -------
@@ -738,43 +807,76 @@ def annotate_accessibility(
             error_dist = np.zeros((df_prot.shape[0], df_prot.shape[0]))
             use_pae = 'nopae'
         idx_list = np.arange(0, df_prot.shape[0])
-        res_a = get_neighbors(
-            idx_list=idx_list,
-            coord_a=np.vstack([df_prot.x_coord_ca.values,
-                              df_prot.y_coord_ca.values,
-                              df_prot.z_coord_ca.values]).T,
-            coord_b=np.vstack([df_prot.x_coord_cb.values,
-                              df_prot.y_coord_cb.values,
-                              df_prot.z_coord_cb.values]).T,
-            coord_c=np.vstack([df_prot.x_coord_c.values,
-                              df_prot.y_coord_c.values,
-                              df_prot.z_coord_c.values]).T,
-            coord_n=np.vstack([df_prot.x_coord_n.values,
-                              df_prot.y_coord_n.values,
-                              df_prot.z_coord_n.values]).T,
-            # If this step is slow, consider avoiding the vstack to create new arrays
-            # Alternatively, it might be faster to use e.g. df[["x", "y", "z"]].values
-            # as pandas might force this into a view rather than a new array
-            position=df_prot.position.values,
-            error_dist=error_dist,
-            max_dist=max_dist,
-            max_angle=max_angle)
+
+        if sidechain is None:
+            res_adjacency = get_neighbors(
+                idx_list=idx_list,
+                coord_a=df_prot[['x_coord_ca', 'y_coord_ca', 'z_coord_ca']].values,
+                coord_b=df_prot[['x_coord_cb', 'y_coord_cb', 'z_coord_cb']].values,
+                coord_c=df_prot[['x_coord_c', 'y_coord_c', 'z_coord_c']].values,
+                coord_n=df_prot[['x_coord_n', 'y_coord_n', 'z_coord_n']].values,
+                position=df_prot.position.values,
+                error_dist=error_dist,
+                max_dist=max_dist,
+                max_angle=max_angle
+            )
+            sc = ''
+        elif sidechain == 'target_only':
+            res_adjacency = get_neighbors(
+                idx_list=idx_list,
+                coord_a=df_prot[['x_coord_ca', 'y_coord_ca', 'z_coord_ca']].values,
+                coord_b=df_prot[['x_coord_cb', 'y_coord_cb', 'z_coord_cb']].values,
+                coord_c=df_prot[['x_coord_c', 'y_coord_c', 'z_coord_c']].values,
+                coord_n=df_prot[['x_coord_n', 'y_coord_n', 'z_coord_n']].values,
+                position=df_prot.position.values,
+                error_dist=error_dist,
+                max_dist=max_dist,
+                max_angle=max_angle,
+                coord_target=df_prot[['x_coord_sc', 'y_coord_sc', 'z_coord_sc']].values
+            )            
+            sc = '_Tsc'
+        elif sidechain == 'source_and_target':
+            res_adjacency = get_neighbors(
+                idx_list=idx_list,
+                coord_a=df_prot[['x_coord_ca', 'y_coord_ca', 'z_coord_ca']].values,
+                coord_b=df_prot[['x_coord_cb', 'y_coord_cb', 'z_coord_cb']].values,
+                coord_c=df_prot[['x_coord_c', 'y_coord_c', 'z_coord_c']].values,
+                coord_n=df_prot[['x_coord_n', 'y_coord_n', 'z_coord_n']].values,
+                position=df_prot.position.values,
+                error_dist=error_dist,
+                max_dist=max_dist,
+                max_angle=max_angle,
+                coord_target=df_prot[['x_coord_sc', 'y_coord_sc', 'z_coord_sc']].values,
+                coord_source=df_prot[['x_coord_sc', 'y_coord_sc', 'z_coord_sc']].values
+            )            
+            sc = '_STsc'
+
+        # Calculate the number of neighboring amino acids for each type
+        res_adjacency = pd.DataFrame(
+            res_adjacency, 
+            columns=[f'n{res}{sc}_{max_dist}_{max_angle}_{use_pae}' for res in df_prot['AA']]
+        )
+        res_adjacency = res_adjacency.groupby(res_adjacency.columns, axis=1).sum()
+        # Calculate the total number of neighboring amino acids
+        res_adjacency[f'nAA{sc}_{max_dist}_{max_angle}_{use_pae}'] = res_adjacency.sum(axis=1)
+
+        # Drop the individual amino acid columns if specified
+        if individual_residue_counts == False:
+            res_adjacency = res_adjacency[f'nAA{sc}_{max_dist}_{max_angle}_{use_pae}']
+        
+
+        # Append results to lists
         proteins.append(df_prot.protein_id.values)
-        # using numeracal prot_numbers might be better.
-        # In general it is good practice to reduce strings/objects in arrays/dfs
-        # as much possible. Especially try to avoid repetetion of such types and
-        # just use indices and a reference array. Rarely do you need this actual
-        # values anyways.
         AA.append(df_prot.AA.values)
         AA_p.append(df_prot.position.values)
-        a_AA.append(res_a)
+        a_AA.append(res_adjacency)
     proteins = np.concatenate(proteins)
     AA = np.concatenate(AA)
     AA_p = np.concatenate(AA_p)
-    a_AA = np.concatenate(a_AA)
+    a_AA = pd.concat(a_AA, ignore_index=True)
     accessibility_df = pd.DataFrame({'protein_id': proteins,
                                      'AA': AA, 'position': AA_p})
-    accessibility_df[f'nAA_{max_dist}_{max_angle}_{use_pae}'] = a_AA
+    accessibility_df = pd.concat([accessibility_df, a_AA], axis=1)
     return(accessibility_df)
 
 
