@@ -21,6 +21,7 @@ import tqdm
 import h5py
 import statsmodels.stats.multitest
 import Bio.PDB.MMCIF2Dict
+from scipy.spatial.distance import pdist, squareform
 import scipy.stats
 import sys
 
@@ -96,6 +97,80 @@ def download_alphafold_cif(
             except urllib.error.HTTPError:
                 if verbose_log:
                     logging.info(f"Protein {protein} not available for CIF download.")
+                invalid_proteins.append(protein)
+    logging.info(f"Valid proteins: {len(valid_proteins)}")
+    logging.info(f"Invalid proteins: {len(invalid_proteins)}")
+    logging.info(f"Existing proteins: {len(existing_proteins)}")
+    return(valid_proteins, invalid_proteins, existing_proteins)
+
+def download_alphafold_pdb(
+    proteins: list,
+    out_folder: str,
+    out_format: str = "{}.pdb",
+    alphafold_pdb_url: str = 'https://alphafold.ebi.ac.uk/files/AF-{protein}-F1-model_v{version}.pdb',
+    timeout: int = 60,
+    verbose_log: bool = False,
+) -> tuple:
+    """
+    Function to download .pdb files of protein structures predicted by AlphaFold.
+
+    Parameters
+    ----------
+    proteins : list
+        List (or any other iterable) of UniProt protein accessions for which to
+        download the structures.
+    out_folder : str
+        Path to the output folder.
+    out_format : str
+        The default file name of the pdb files to be saved.
+        The brackets {} are replaced by a protein name from the proteins list.
+        Default is '{}.pdb'.
+    alphafold_pdb_url : str
+        The base link from where to download pdb files.
+        The brackets {} are replaced by a protein name from the proteins list.
+        Default is 'https://alphafold.ebi.ac.uk/files/AF-{}-F1-model_v1.pdb'.
+    timeout : int
+        Time to wait for reconnection of downloads.
+        Default is 60.
+    verbose_log: bool
+        Whether to write verbose logging information.
+        Default is False.
+
+    Returns
+    -------
+    : (list, list, list)
+        The lists of valid, invalid and existing protein accessions.
+    """
+    socket.setdefaulttimeout(timeout)
+    valid_proteins = []
+    invalid_proteins = []
+    existing_proteins = []
+    AFversions = [9, 8, 7, 6, 5, 4, 3, 2, 1] #Dirty fix, but should hold up for the foreseeable future
+
+    if not os.path.exists(out_folder):
+        os.makedirs(out_folder)
+    for protein in tqdm.tqdm(proteins):
+        name_out = os.path.join(
+            out_folder,
+            out_format.format(protein)
+        )
+        if os.path.isfile(name_out):
+            existing_proteins.append(protein)
+        else:
+            for AFversion in AFversions:
+                response = requests.get(alphafold_pdb_url.format(protein=protein,version=AFversion))
+                if response.status_code == 200:
+                    latest_AFversion = AFversion
+                    break
+                else:
+                    latest_AFversion = 404
+            name_in = alphafold_pdb_url.format(protein=protein,version=latest_AFversion)
+            try:
+                urllib.request.urlretrieve(name_in, name_out)
+                valid_proteins.append(protein)
+            except urllib.error.HTTPError:
+                if verbose_log:
+                    logging.info(f"Protein {protein} not available for PDB download.")
                 invalid_proteins.append(protein)
     logging.info(f"Valid proteins: {len(valid_proteins)}")
     logging.info(f"Invalid proteins: {len(invalid_proteins)}")
@@ -300,6 +375,7 @@ def format_alphafold_data(
                                    'z_coord': structure['_atom_site.Cartn_z']})
 
                 df = df.reset_index(drop=True)
+                # return df
                 df = df.pivot(index=['protein_id',
                                      'protein_number',
                                      'AA', 'position',
@@ -1989,3 +2065,211 @@ def format_for_3Dviz(
     df_mod["PTMtypes"] = [[ptm_dataset] for i in df_mod["PTMsites"]]
     df_mod = df_mod.dropna(subset=['PTMtypes']).reset_index(drop=True)
     return df_mod
+
+def load_structure(protein, cif_dir, error_dir):
+    # Load structure
+    structure = Bio.PDB.MMCIF2Dict.MMCIF2Dict(os.path.join(
+        cif_dir, f'{protein}.cif'
+    ))
+    atom_data = pd.DataFrame({'protein_id': structure['_atom_site.pdbx_sifts_xref_db_acc'],
+                        'AA': structure['_atom_site.pdbx_sifts_xref_db_res'],
+                        'position': structure['_atom_site.label_seq_id'],
+                        'quality': structure['_atom_site.B_iso_or_equiv'],
+                        'atom_id': structure['_atom_site.label_atom_id'],
+                        'x': structure['_atom_site.Cartn_x'],
+                        'y': structure['_atom_site.Cartn_y'],
+                        'z': structure['_atom_site.Cartn_z']})
+
+    atom_data = atom_data.reset_index(drop=True)
+    atom_data[['x', 'y', 'z', 'quality']] = atom_data[['x', 'y', 'z', 'quality']].astype(float)
+    atom_data['position'] = atom_data['position'].astype(int)
+    atom_data['AA_atom_id'] = atom_data['AA'] + '_' + atom_data['atom_id']
+
+    # Load paired alignment errors, if using them
+    if error_dir is not None:
+        with h5py.File(os.path.join(
+            error_dir,
+            f'pae_{protein}.hdf'
+        )) as hdf_root:
+            error_dist = hdf_root['dist'][...]
+        size = int(np.sqrt(len(error_dist)))
+        error_dist = error_dist.reshape(size, size)
+        use_pae = 'pae'
+    else:
+        n_residues = atom_data['position'].max()
+        error_dist = np.zeros((n_residues, n_residues))
+        use_pae = 'nopae'
+
+    return atom_data, error_dist, use_pae
+
+def calculate_distances(atom_data, mask_same_res=True, use_pae='nopae'):
+        
+    # Compute pairwise Euclidean distances
+    pairwise_distances = squareform(pdist(
+        atom_data[['x', 'y', 'z']], 
+        metric='euclidean'
+    ))
+
+    if mask_same_res:
+        # Mask out atoms belonging to the same residue
+        positions = atom_data["position"].to_numpy()
+        same_aa_mask = (positions[:, None] == positions[None, :]).astype(int)
+        pairwise_distances[same_aa_mask.astype(bool)] = np.nan
+
+    return pairwise_distances
+
+def calculate_angles(atom_data, res_data):
+    res_data = res_data.sort_values(by='position') # To ensure consistent ordering
+    res_CA = res_data['CA'].values
+    res_CB = res_data['CB'].values
+    atom_xyz = atom_data[['x', 'y', 'z']].values
+
+    # Get unit vector of Cys CA-CB
+    cys_unit_vector = res_CB - res_CA 
+    cys_unit_vector /= np.linalg.norm(cys_unit_vector, axis=1)[:, None]
+
+    # Get the unit vector of Cys CA-all other atoms, using atom_xyz and cys_CA
+    cys_atom_unit_vector = atom_xyz - res_CA[:, None, :]
+    cys_atom_unit_vector = cys_atom_unit_vector / np.linalg.norm(cys_atom_unit_vector, axis=2)[:, :, None] 
+    # ^ Zero div warning due to calculating Cys_CA-Cys_CA atoms ^
+
+    # Convert to degrees
+    angles = np.rad2deg(np.arccos(
+        (cys_atom_unit_vector * cys_unit_vector[:, None, :]).sum(axis=-1)
+    ))
+    return angles
+
+
+def calculate_distance_features(proteins, cif_dir, error_dir=None):
+
+    prot_df_list = []
+    for protein in proteins:
+        
+        atom_data, error_dist, use_pae = load_structure(protein, cif_dir, error_dir)
+
+        # Create residue-level dataframe
+        res_data = atom_data.drop(columns=['AA_atom_id']).pivot(
+            index=[
+                'protein_id',
+                'position',
+                'AA',
+                'quality'
+            ],
+            columns='atom_id'
+        )
+        res_data.columns = res_data.columns.reorder_levels([1,0])
+
+        # Calculate pairwise atom distances
+        pairwise_distances = calculate_distances(atom_data, use_pae)
+        if use_pae == 'pae':
+            # Mask out distances with high alignment error
+            positions_0 = atom_data['position'].to_numpy() - 1
+            expanded_error = error_dist[positions_0[:, None], positions_0[None, :]]
+            pairwise_distances += expanded_error
+        
+        # Calculate angles
+        angles = calculate_angles(atom_data, res_data.query('AA=="C"'))
+        
+        # Get distances between SG and other atoms, masked by angles
+        sg_data = atom_data.query('atom_id == "SG"')
+        sg_data = sg_data.sort_values(by='position') # To ensure consistent ordering
+        sg_ind = sg_data.index
+        sg_atom_dists = pairwise_distances[sg_ind,:]
+        sg_atom_dists[angles > 70] = np.nan
+
+        # Calculate distance features
+        hb_N = ['H_ND1', 'H_NE2', 'N_ND2', 'Q_NE2', 'W_NE1'] # H bond donors
+        hb_O = ['S_OG', 'T_OG1', 'Y_OH'] # H bond acceptors
+        pos_N = ['K_NZ', 'R_NE', 'R_NH1', 'R_NH2'] # Positive N
+        neg_O = ['E_OE1', 'E_OE2', 'D_OD1', 'D_OD2'] # Negative O
+        atomtype_inds = {
+            'hb_N': atom_data.query('AA_atom_id in @hb_N').index,
+            'hb_O': atom_data.query('AA_atom_id in @hb_O').index,
+            'pos_N': atom_data.query('AA_atom_id in @pos_N').index,
+            'neg_O': atom_data.query('AA_atom_id in @neg_O').index,
+            'bb_N': atom_data.query('atom_id=="N"').index # Backbone N
+        }
+
+        feature_cols = [f"{atom}{suffix}" for atom in atomtype_inds.keys() 
+                        for suffix in [f"1_{use_pae}", f"2_{use_pae}"]]
+        df = pd.DataFrame(index=res_data.index, columns=feature_cols).reset_index().query('AA=="C"').sort_values(by='position')
+        for atomtype, inds in atomtype_inds.items():
+            cols = [atomtype + f'1_{use_pae}', atomtype + f'2_{use_pae}']
+            df.loc[:,cols] = np.sort(sg_atom_dists[:,inds], axis=1)[:,:2]
+
+
+        # Calculate pocketminer features
+        pm_file = os.path.join(cif_dir.split('cif')[0], f'pdb/pocketminer_preds/{protein}-preds.npy')
+        # pm_file = os.path.join("/mnt/nimble/data/output/abarthmaron/abpp/structuremap", f'pdb/pocketminer_preds/{protein}-preds.npy')
+        if os.path.isfile(pm_file):
+
+            pocketminer_preds = np.load(pm_file).squeeze()
+            CA_data = atom_data.query('atom_id=="CA"')
+            CA_data = CA_data.sort_values(by='position')
+            CA_inds = CA_data.index
+            CA_atom_dists = pairwise_distances[sg_ind,:][:,CA_inds]
+
+            # PSE1: SG-CA distance < 12
+            pse_mask = (CA_atom_dists <= 12)
+            pse_mask *= (angles[:,CA_inds] <= 180)
+            pse_pm_preds = pocketminer_preds * pse_mask
+            pse_pm_preds = pse_pm_preds.sum(axis=1) / pse_mask.sum(axis=1)
+            col = f'pm_12_180_{use_pae}'
+            df[col] = pse_pm_preds
+
+            # PSE2: SG-CA distance < 12, angle < 70
+            pse_mask = (CA_atom_dists <= 12)
+            pse_mask *= (angles[:,CA_inds] <= 70)
+            pse_pm_preds = pocketminer_preds * pse_mask
+            pse_pm_preds = pse_pm_preds.sum(axis=1) / pse_mask.sum(axis=1)
+            col = f'pm_12_70_{use_pae}'
+            df[col] = pse_pm_preds
+
+            #
+            cys_ind = sg_data['position'].values - 1
+            df['pocketminer_preds'] = pocketminer_preds[cys_ind]
+
+            # Get average pm pred of nearest sequence neighbors
+            df['pm_preds_n3'] = pocketminer_preds[cys_ind]
+            df['pm_preds_n3'] += pocketminer_preds[
+                np.minimum(cys_ind + 1, len(pocketminer_preds) - 1)]
+            df['pm_preds_n3'] += pocketminer_preds[
+                np.maximum(cys_ind - 1, 0)]
+            df['pm_preds_n3'] /= 3
+
+
+        quality = res_data.reset_index()['quality'].values
+        CA_data = atom_data.query('atom_id=="CA"')
+        CA_data = CA_data.sort_values(by='position')
+        CA_inds = CA_data.index
+        CA_atom_dists = pairwise_distances[sg_ind,:][:,CA_inds]
+
+        # PSE1: SG-CA distance < 12
+        pse_mask = (CA_atom_dists <= 12)
+        pse_mask *= (angles[:,CA_inds] <= 180)
+        pse_quality = quality * pse_mask
+        pse_quality = pse_quality.sum(axis=1) / pse_mask.sum(axis=1)
+        col = f'quality_12_180_{use_pae}'
+        df[col] = pse_quality
+
+        # PSE2: SG-CA distance < 12, angle < 70
+        pse_mask = (CA_atom_dists <= 12)
+        pse_mask *= (angles[:,CA_inds] <= 70)
+        pse_quality = quality * pse_mask
+        pse_quality = pse_quality.sum(axis=1) / pse_mask.sum(axis=1)
+        col = f'quality_12_70_{use_pae}'
+        df[col] = pse_quality
+
+        #
+        cys_ind = sg_data['position'].values - 1
+
+        # Get average pm pred of nearest sequence neighbors
+        df['quality_preds_n3'] = quality[cys_ind]
+        df['quality_preds_n3'] += quality[
+            np.minimum(cys_ind + 1, len(quality) - 1)]
+        df['quality_preds_n3'] += quality[
+            np.maximum(cys_ind - 1, 0)]
+        df['quality_preds_n3'] /= 3
+
+        prot_df_list.append(df)
+    return pd.concat(prot_df_list)
