@@ -42,13 +42,13 @@ cif_dir = os.path.join(output_dir, 'cif')
 pae_dir = os.path.join(output_dir, 'pae')
 
 # output_dir = tempfile.gettempdir()
-# # human_fasta_list = ['Q9NRZ5', 'O43353','P24941','Q92918','P45984','P28482','O96017',
-# #                  'P02730','Q8NB16','Q13546','P29320','P08559','P15121']
-# human_fasta_list = ['O43353']
+# human_fasta_list = ['Q9NRZ5', 'O43353','P24941','Q92918','P45984','P28482','O96017',
+#                  'P02730','Q8NB16','Q13546','P29320','P08559','P15121']
+# # human_fasta_list = ['O43353']
 # cif_dir = os.path.join(output_dir, 'tutorial_cif')
 # pae_dir = os.path.join(output_dir, 'tutorial_pae')
 
-parallelize_download = False
+parallelize_download = True
 if parallelize_download:
     # Determine the number of CPU cores to use 
     n_jobs = 300  
@@ -94,6 +94,8 @@ else:
         directory=cif_dir, 
         protein_ids=human_fasta_list)
     
+alphafold_annotation.to_csv(os.path.join(output_dir, '2025-01-09_alphafold_annotation.csv'), index=False)
+
 for p in [pae_dir, None]:
     for dist in [9, 12, 24]:
         full_sphere_exposure = calculate_pPSE(
@@ -119,7 +121,7 @@ for p in [pae_dir, None]:
 
 merge_cols = ['protein_id', 'position', 'AA', 'quality']
 for p in [pae_dir, None]:
-    df = calculate_distance_features(human_fasta_list, cif_dir, error_dir=p)
+    df = calculate_distance_features(alphafold_annotation['protein_id'].unique().tolist(), cif_dir, error_dir=p)
     overlap_cols = df.drop(columns=merge_cols).columns.intersection(alphafold_accessibility.columns)
     df = df.drop(columns=overlap_cols)
     alphafold_accessibility = alphafold_accessibility.merge(df, how='left', on=['protein_id', 'position', 'AA', 'quality'])
