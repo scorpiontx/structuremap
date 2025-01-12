@@ -95,36 +95,109 @@ else:
         protein_ids=human_fasta_list)
     
 alphafold_annotation.to_csv(os.path.join(output_dir, '2025-01-09_alphafold_annotation.csv'), index=False)
+alphafold_annotation = pd.read_csv(os.path.join(output_dir, '2025-01-09_alphafold_annotation.csv'))
 
-for p in [pae_dir, None]:
-    for dist in [9, 12, 24]:
-        full_sphere_exposure = calculate_pPSE(
+alphafold_accessibility = alphafold_annotation.copy()
+
+# PSE features
+parallelize_pse_calc = True
+if parallelize_pse_calc:
+    pse_params = [
+        {'max_dist': 9, 'max_angle': 180, 'pae_dir': pae_dir},
+        {'max_dist': 12, 'max_angle': 180, 'pae_dir': pae_dir},
+        {'max_dist': 24, 'max_angle': 180, 'pae_dir': pae_dir},
+        {'max_dist': 9, 'max_angle': 70, 'pae_dir': pae_dir},
+        {'max_dist': 12, 'max_angle': 70, 'pae_dir': pae_dir},
+        {'max_dist': 15, 'max_angle': 70, 'pae_dir': pae_dir},
+        {'max_dist': 9, 'max_angle': 180, 'pae_dir': None},
+        {'max_dist': 12, 'max_angle': 180, 'pae_dir': None},
+        {'max_dist': 24, 'max_angle': 180, 'pae_dir': None},
+        {'max_dist': 9, 'max_angle': 70, 'pae_dir': None},
+        {'max_dist': 12, 'max_angle': 70, 'pae_dir': None},
+        {'max_dist': 15, 'max_angle': 70, 'pae_dir': None},
+    ]
+
+    # Calculate distance features in parallel
+    pse_df_list = Parallel(n_jobs=-1, backend='loky', verbose=10)(
+        delayed(calculate_pPSE)(
             df=alphafold_annotation, 
-            max_dist=24, 
-            max_angle=180, 
-            error_dir=pae_dir)
+            max_dist=p['max_dist'], 
+            max_angle=p['max_angle'], 
+            error_dir=p['pae_dir']
+        ) for p in pse_params
+    )
 
-        alphafold_accessibility = alphafold_annotation.merge(
-            full_sphere_exposure, how='left', on=['protein_id','AA','position'])
-
-
-for p in [pae_dir, None]:
-    for dist in [9, 12, 15]:
-        part_sphere_exposure = calculate_pPSE(
-            df=alphafold_annotation, 
-            max_dist=dist, 
-            max_angle=70, 
-            error_dir=p)
-
+    # Merge the PSE features with the alphafold_accessibility dataframe
+    for pse_df in pse_df_list:
         alphafold_accessibility = alphafold_accessibility.merge(
-            part_sphere_exposure, how='left', on=['protein_id','AA','position'])
+            pse_df, 
+            how='left', 
+            on=['protein_id','AA','position']
+        )
+else:
+    for p in [pae_dir, None]:
+        for dist in [9, 12, 24]:
+            full_sphere_exposure = calculate_pPSE(
+                df=alphafold_annotation, 
+                max_dist=dist, 
+                max_angle=180, 
+                error_dir=pae_dir)
 
+            alphafold_accessibility = alphafold_accessibility.merge(
+                full_sphere_exposure, how='left', on=['protein_id','AA','position'])
+    for p in [pae_dir, None]:
+        for dist in [9, 12, 15]:
+            part_sphere_exposure = calculate_pPSE(
+                df=alphafold_annotation, 
+                max_dist=dist, 
+                max_angle=70, 
+                error_dir=p)
+
+            alphafold_accessibility = alphafold_accessibility.merge(
+                part_sphere_exposure, how='left', on=['protein_id','AA','position'])
+
+
+# Distance features
+parallelize_distance_feature_calc = True
 merge_cols = ['protein_id', 'position', 'AA', 'quality']
-for p in [pae_dir, None]:
-    df = calculate_distance_features(alphafold_annotation['protein_id'].unique().tolist(), cif_dir, error_dir=p)
-    overlap_cols = df.drop(columns=merge_cols).columns.intersection(alphafold_accessibility.columns)
-    df = df.drop(columns=overlap_cols)
-    alphafold_accessibility = alphafold_accessibility.merge(df, how='left', on=['protein_id', 'position', 'AA', 'quality'])
+for error_dir in [pae_dir, None]:
+    
+    protein_list = alphafold_annotation['protein_id'].unique().tolist()
+
+    if parallelize_distance_feature_calc:
+        # Determine the number of CPU cores to use 
+        n_jobs = 70
+
+        # Split the list of protein IDs into sublists
+        protein_array = np.array_split(np.array(protein_list), n_jobs)
+        protein_list = [list(x) for x in protein_array]
+
+        # Calculate distance features in parallel
+        distance_feature_list = Parallel(n_jobs=n_jobs, backend='loky', verbose=5)(
+            delayed(calculate_distance_features)(
+                prot_list, 
+                cif_dir, 
+                error_dir
+            ) for prot_list in protein_list
+        )
+        distance_feature_df = pd.concat(distance_feature_list)
+    else:
+        distance_feature_df = calculate_distance_features(
+            protein_list, 
+            cif_dir, 
+            error_dir=error_dir
+        )
+
+    # Remove columns that are already in the alphafold_accessibility dataframe
+    overlap_cols = distance_feature_df.drop(columns=merge_cols).columns.intersection(alphafold_accessibility.columns)
+    distance_feature_df = distance_feature_df.drop(columns=overlap_cols)
+
+    # Merge the distance features with the alphafold_accessibility dataframe
+    alphafold_accessibility = alphafold_accessibility.merge(
+        distance_feature_df, 
+        how='left', 
+        on=['protein_id', 'position', 'AA', 'quality']
+    )
 
 alphafold_accessibility['high_acc_5'] = np.where(alphafold_accessibility.nAA_12_70_pae <= 5, 1, 0)
 alphafold_accessibility['low_acc_5'] = np.where(alphafold_accessibility.nAA_12_70_pae > 5, 1, 0)

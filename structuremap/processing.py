@@ -2130,21 +2130,23 @@ def calculate_angles(atom_data, res_data):
 
     # Get the unit vector of Cys CA-all other atoms, using atom_xyz and cys_CA
     cys_atom_unit_vector = atom_xyz - res_CA[:, None, :]
-    cys_atom_unit_vector = cys_atom_unit_vector / np.linalg.norm(cys_atom_unit_vector, axis=2)[:, :, None] 
+    with np.errstate(divide='ignore', invalid='ignore'): # Suppress errors for NaNs which occur when taking angle to same atom
+        cys_atom_unit_vector = cys_atom_unit_vector / np.linalg.norm(cys_atom_unit_vector, axis=2)[:, :, None] 
     # ^ Zero div warning due to calculating Cys_CA-Cys_CA atoms ^
 
     # Convert to degrees
-    angles = np.rad2deg(np.arccos(
-        (cys_atom_unit_vector * cys_unit_vector[:, None, :]).sum(axis=-1)
-    ))
+    with np.errstate(divide='ignore', invalid='ignore'): # Suppress errors for NaNs which occur when taking angle to same atom
+        angles = np.rad2deg(np.arccos(
+            (cys_atom_unit_vector * cys_unit_vector[:, None, :]).sum(axis=-1)
+        ))
     return angles
 
 
 def calculate_distance_features(proteins, cif_dir, error_dir=None):
-
+    
     prot_df_list = []
-    for protein in proteins:
-        
+    for protein in tqdm.tqdm(proteins):
+        # try:
         atom_data, error_dist, use_pae = load_structure(protein, cif_dir, error_dir)
 
         # Create residue-level dataframe
@@ -2194,9 +2196,17 @@ def calculate_distance_features(proteins, cif_dir, error_dir=None):
                         for suffix in [f"1_{use_pae}", f"2_{use_pae}"]]
         df = pd.DataFrame(index=res_data.index, columns=feature_cols).reset_index().query('AA=="C"').sort_values(by='position')
         for atomtype, inds in atomtype_inds.items():
-            cols = [atomtype + f'1_{use_pae}', atomtype + f'2_{use_pae}']
-            df.loc[:,cols] = np.sort(sg_atom_dists[:,inds], axis=1)[:,:2]
-
+            cols = [f"{atomtype}1_{use_pae}", f"{atomtype}2_{use_pae}"]
+            # Initialize columns with NaN (so shape = (n_rows, 2) is guaranteed)
+            df[cols] = np.nan  
+            
+            # Only if inds is non-empty, fill in up to 2 columns
+            if len(inds) > 0:
+                # Sort distances
+                sorted_vals = np.sort(sg_atom_dists[:, inds], axis=1)
+                # Slice only the number of columns you actually have indices for
+                slice_size = min(sorted_vals.shape[1], 2)  # 0, 1, or 2
+                df.loc[:, cols[:slice_size]] = sorted_vals[:, :slice_size]
 
         # Calculate pocketminer features
         pm_file = os.path.join(cif_dir.split('cif')[0], f'pdb/pocketminer_preds/{protein}-preds.npy')
@@ -2221,7 +2231,8 @@ def calculate_distance_features(proteins, cif_dir, error_dir=None):
             pse_mask = (CA_atom_dists <= 12)
             pse_mask *= (angles[:,CA_inds] <= 70)
             pse_pm_preds = pocketminer_preds * pse_mask
-            pse_pm_preds = pse_pm_preds.sum(axis=1) / pse_mask.sum(axis=1)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                pse_pm_preds = pse_pm_preds.sum(axis=1) / pse_mask.sum(axis=1)
             col = f'pm_12_70_{use_pae}'
             df[col] = pse_pm_preds
 
@@ -2256,7 +2267,8 @@ def calculate_distance_features(proteins, cif_dir, error_dir=None):
         pse_mask = (CA_atom_dists <= 12)
         pse_mask *= (angles[:,CA_inds] <= 70)
         pse_quality = quality * pse_mask
-        pse_quality = pse_quality.sum(axis=1) / pse_mask.sum(axis=1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            pse_quality = pse_quality.sum(axis=1) / pse_mask.sum(axis=1)
         col = f'quality_12_70_{use_pae}'
         df[col] = pse_quality
 
@@ -2272,4 +2284,8 @@ def calculate_distance_features(proteins, cif_dir, error_dir=None):
         df['quality_preds_n3'] /= 3
 
         prot_df_list.append(df)
+        # except Exception as e:
+        #     print(protein)
+        #     print(f"An exception occurred: {e}")
+        #     raise
     return pd.concat(prot_df_list)
